@@ -4249,6 +4249,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+/// A console MS container (what a retail game's minimap pipelines put in the AS slot).
+fn console_ms(code: &[u8]) -> bool {
+    crate::gpu::recomp::pso::is_console(code) && crate::gpu::xbox::parse(code).is_some_and(|sh| sh.stage == "MS")
+}
+
 /// The mesh and amplification shaders of a stream, as XCL translates them: a console MS
 /// container in the AS slot with no MS subobject (a retail game's minimap pipelines) is the
 /// mesh shader it says it is. It used to be refused – translated, the title rendered nothing
@@ -4256,9 +4261,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 /// not the slot. With the chunk budget fixed they translate and the title keeps rendering.
 /// Returns (MS to translate, AS left): the moved shader is not an AS any more.
 fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
-    use crate::gpu::recomp::pso::is_console;
     match (ms_slot, as_slot) {
-        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => (Some(a), None),
+        (None, Some(a)) if console_ms(a) => (Some(a), None),
         (ms, a) => (ms, a),
     }
 }
@@ -4304,6 +4308,42 @@ mod mesh_slot_tests {
         });
         assert!(missed, "the attempt is missed: the caller takes the background path");
         assert!(!crate::gpu::recomp::dxc::defer(), "outside: the build translates");
+    }
+
+    /// A stream of shader subobjects (type, code), laid out as D3D12 reads it: a 4-byte type,
+    /// padding to 8, then the shader's (pointer, length).
+    fn stream(shaders: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut s = Vec::new();
+        for &(ty, code) in shaders {
+            s.extend_from_slice(&(ty as u64).to_le_bytes());
+            s.extend_from_slice(&(code.as_ptr() as u64).to_le_bytes());
+            s.extend_from_slice(&(code.len() as u64).to_le_bytes());
+        }
+        s
+    }
+
+    /// The stand-in of a stream with a console MS alone in the AS slot has the stand-in MS in an
+    /// MS subobject (it had a null AS, a PS and no VS / MS: refused by the driver, so every such
+    /// pipeline was built in the title's call); a console AS keeps its AS subobject.
+    #[test]
+    fn the_stand_in_of_a_console_ms_in_the_as_slot_has_a_mesh_shader() {
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
+        let ps = b"console-ps".to_vec();
+        let dm = super::dummy_mesh().expect("stand-in mesh shaders");
+        let fallback = |s: &[u8]| {
+            let desc = [s.len(), s.as_ptr() as usize];
+            let (buf, _) = unsafe { super::fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
+            super::stream_subobjects(&buf).unwrap().iter().map(|&(ty, p)| (ty, u64::from_le_bytes(p[0..8].try_into().unwrap()) as usize)).collect::<Vec<_>>()
+        };
+        let subs = fallback(&stream(&[(24, &ms), (2, &ps)]));
+        assert_eq!(subs, vec![(25, dm.0.as_ptr() as usize), (2, dm.1.as_ptr() as usize)]);
+        let subs = fallback(&stream(&[(24, &as_), (2, &ps)]));
+        assert_eq!(subs[0], (24, 0));
     }
 }
 
@@ -4473,7 +4513,15 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    // a console MS alone in the AS slot is the mesh shader (`mesh_shader_slots`): its stand-in
+    // is the stand-in MS in an MS subobject – a stream with a null AS, a PS and no VS / MS was
+    // refused (E_INVALIDARG), and every such pipeline was built in the title's call
+    let (mesh, ms_in_as) = stream_subobjects(&buf).map_or((false, false), |subs| {
+        let of = |t: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == t.0 as u32);
+        let ms = of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS).is_some();
+        let ms_in_as = !ms && of(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS).and_then(|s| payload_shader(s.1)).is_some_and(console_ms);
+        (ms || ms_in_as, ms_in_as)
+    });
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -4492,6 +4540,10 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             1 => put(&mut buf, &d.vs),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
+            24 if ms_in_as => {
+                buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
+                put(&mut buf, &dm?.0)
+            }
             3 | 4 | 5 | 24 => put(&mut buf, &[]),
             25 => put(&mut buf, &dm?.0),
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
