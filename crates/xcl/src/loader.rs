@@ -203,6 +203,12 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
+    // 5b. defuse watchdog crash abort in executables
+    for s in pe.sections.iter().filter(|s| s.characteristics & pe::SCN_MEM_EXECUTE != 0) {
+        let len = (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize));
+        unsafe { defuse_watchdog_crash(base + s.va as usize, len, &name) };
+    }
+
     // 6. page protections
     unsafe {
         let mut old = 0u32;
@@ -243,6 +249,25 @@ unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64,
         }
     }
     Ok(())
+}
+
+/// Defuse deliberate watchdog crashes (`mov [0], 0x4D8BD421; add rsp, 0x48; ret`)
+/// so long shader compilation or world streaming freezes do not trip an artificial 30-second kill.
+unsafe fn defuse_watchdog_crash(base: usize, len: usize, name: &str) -> bool {
+    let code = std::slice::from_raw_parts_mut(base as *mut u8, len);
+    const TARGET: [u8; 16] = [
+        0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x21, 0xd4, 0x8b, 0x4d, 0x48, 0x83, 0xc4, 0x48, 0xc3,
+    ];
+    const PATCH: [u8; 16] = [
+        0x48, 0x83, 0xc4, 0x48, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x48, 0x83, 0xc4, 0x48, 0xc3,
+    ];
+    if let Some(pos) = code.windows(TARGET.len()).position(|w| w == TARGET) {
+        code[pos..pos + PATCH.len()].copy_from_slice(&PATCH);
+        crate::xlog_info!("{name}: defused engine watchdog abort at {:#x}", base + pos);
+        true
+    } else {
+        false
+    }
 }
 
 unsafe fn run_tls_callbacks(m: &MappedModule, reason: u32) {
@@ -422,6 +447,19 @@ pub fn on_tls_event(reason: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_crash_sequence_is_defused() {
+        let mut bytes = vec![0x90; 32];
+        const TARGET: [u8; 16] = [
+            0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x21, 0xd4, 0x8b, 0x4d, 0x48, 0x83, 0xc4, 0x48, 0xc3,
+        ];
+        bytes[8..24].copy_from_slice(&TARGET);
+        let defused = unsafe { defuse_watchdog_crash(bytes.as_mut_ptr() as usize, bytes.len(), "test.exe") };
+        assert!(defused);
+        assert_eq!(&bytes[8..13], &[0x48, 0x83, 0xc4, 0x48, 0xc3]);
+        assert_eq!(&bytes[13..19], &[0x90; 6]);
+    }
 
     /// A PE32+ DLL of one section (.text at RVA 0x1000) holding `code`, its entry point at the
     /// start of it, preferred at `image_base` and relocatable (one empty block at RVA 0x1100);
