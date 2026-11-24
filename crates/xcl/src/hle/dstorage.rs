@@ -274,8 +274,20 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let n = r.destination_size as usize;
     let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
     let ok = match target {
-        FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
+        FillTarget::Pages(pages) => {
+            let late: Vec<usize>;
+            let effective = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, pages.len() * std::mem::size_of::<usize>()) {
+                late = (0..pages.len()).map(|k| {
+                    if pages[k] != 0 { pages[k] } else { unsafe { (r.destination as *const usize).add(k).read_unaligned() } }
+                }).collect();
+                &late[..]
+            } else {
+                pages
+            };
+            crate::hle::kernelx::write_physical_pages(effective, r.destination_page_offset as usize, &bytes)
+        }
         FillTarget::Virtual => {
+            crate::hle::kernelx::lazy::ensure(r.destination as usize, n);
             if !writable(r.destination as usize, n) {
                 return false;
             }
@@ -1022,20 +1034,23 @@ impl QueueInner {
                             continue;
                         }
                         if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
+                            if (hr == E_ACCESS_VIOLATION || hr == E_DECOMPRESSION) && bcpack_ok_from_env() {
+                                crate::xlog_warn!("DirectStorage: suppressed error ({hr:#x}) for {} bytes under XCL_DSTORAGE_BCPACK_OK", req.destination_size);
+                            } else {
+                                self.fail(hr, req, file.as_deref());
+                                if since_status >= 0 {
+                                    since_status = hr;
+                                }
                             }
                         }
                     }
                     Entry::Refused { hr, req, file, fill } => {
                         let mut ok = false;
+                        if hr == E_DECOMPRESSION && req.bcpack() != 0 && bcpack_ok_from_env() {
+                            ok = true;
+                        }
                         if let Some(t) = &fill {
-                            // the destination gets solid blocks; if BCPACK_OK is set, the request is completed as S_OK
-                            let filled = unsafe { bcpack_fill(&req, t) };
-                            if filled && bcpack_ok_from_env() {
-                                ok = true;
-                            }
+                            let _ = unsafe { bcpack_fill(&req, t) };
                         }
                         if !ok {
                             self.fail(hr, req, file.as_deref());
